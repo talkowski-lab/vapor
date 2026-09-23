@@ -91,3 +91,26 @@ additional information will be added to the info column of the VCF:
 	##INFO=<ID=VaPoR_GQ,Number=1,Type=Float,Description="Genotype quality score - likelihood of the second most likely genotype on a -log10 normalized scale"'
 	##INFO=<ID=VaPoR_REC,Number=.,Type=Float,Description="Similarity scores assigned to each of the reads traversings the predicted SV">'
  
+
+## Performance options and regression testing
+
+`vapor bed` accepts `--threads N` to score SVs in `N` worker processes. Results are written in
+input order, and `out.vapor`, the plots and stdout are identical for every `N`. Each worker uses
+one BLAS/OpenMP thread (set `OMP_NUM_THREADS` explicitly to override). Reads and reference
+sequence are read through `pysam`; `samtools` is still needed on `PATH` for unusual regions.
+
+`--no-plots` skips drawing the per-SV dot plot PNGs, which take roughly half of the runtime;
+the output table is unchanged.
+
+Region queries are much faster with a CSI index with small bins, which returns the same reads:
+
+```
+samtools index -c -m 10 sample.bam
+```
+
+Equivalence tests comparing the optimized functions with the original implementations
+(they use the files in `test_data/` when present):
+
+```
+python -m pytest tests/
+```

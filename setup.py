@@ -1,8 +1,5 @@
 from setuptools import setup
-from distutils.core import setup,Extension
-from Cython.Build import cythonize
-import os
-import sys
+
 setup(
    name="VaPoR",
    version="0.0.1",
@@ -18,10 +15,10 @@ setup(
            "contrib/SMCScoring.py",
        ],
    },
-    ext_modules = cythonize("vapor_vali/*.pyx"),
-     install_requires=[
-     'cython', 'numpy','scipy','matplotlib','scikit-learn','rpy2'
+    install_requires=[
+     'numpy', 'scipy', 'matplotlib', 'scikit-learn', 'pysam'
       ],
+    python_requires='>=3.8',
     license="Propriety",
     keywords="Long read",
     classifiers=[
@@ -31,9 +28,7 @@ setup(
        "Intended Audience :: Science/Research",
        "License :: Other/Proprietary License",
        "Natural Language :: English",
-       "Programming Language :: Python :: 2",
-       "Programming Language :: Python :: 2 :: Only",
+       "Programming Language :: Python :: 3",
        "Topic :: Scientific/Engineering :: Bio-Informatics",
    ],
 )
-
