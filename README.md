@@ -99,6 +99,9 @@ input order, and `out.vapor`, the plots and stdout are identical for every `N`. 
 one BLAS/OpenMP thread (set `OMP_NUM_THREADS` explicitly to override). Reads and reference
 sequence are read through `pysam`; `samtools` is still needed on `PATH` for unusual regions.
 
+`--no-plots` skips drawing the per-SV dot plot PNGs, which take roughly half of the runtime;
+the output table is unchanged.
+
 Region queries are much faster with a CSI index with small bins, which returns the same reads:
 
 ```

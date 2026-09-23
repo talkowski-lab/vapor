@@ -298,6 +298,7 @@ if __name__ == '__main__':
 		parser.add_argument('--output-file', required=True, help = 'name of output file')
 		parser.add_argument('--PB-supp', required=False, help='minimum number of evaluable PacBio reads')
 		parser.add_argument('--threads', required=False, type=int, default=1, help='number of worker processes for the bed mode (default 1)')
+		parser.add_argument('--no-plots', action='store_true', help='bed mode: do not draw the per-SV dot plot PNGs (scores are unchanged)')
 		args = parser.parse_args(sys.argv[2:])
 
 		if function_name=='ins':
@@ -336,7 +337,7 @@ if __name__ == '__main__':
 				bed_info=bed_info_readin(bed_input,out_path)
 				write_output_initiate(out_name)
 				from vapor_vali.parallel import run_bed
-				run_bed(bed_info,out_name,num_reads_cff,bam_in,ref,out_path,sample_name,threads=args.threads)
+				run_bed(bed_info,out_name,num_reads_cff,bam_in,ref,out_path,sample_name,threads=args.threads,plots=not args.no_plots)
 		elif function_name=='vcf':
 			if len(sys.argv)==2:
 				import vapor_vali.prep as prep

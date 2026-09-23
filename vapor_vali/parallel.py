@@ -33,7 +33,8 @@ def _score_bed_record(task):
     Returns (row for write_output_main or None, text the original printed to stdout).
     """
     from vapor_vali import Simple_function as sf
-    plt_li, x, num_reads_cff, bam_in, ref, out_path, sample_name = task
+    plt_li, x, num_reads_cff, bam_in, ref, out_path, sample_name, plots = task
+    sf.set_plot_output(plots)
     buf = io.StringIO()
     row = None
     with redirect_stdout(buf):
@@ -66,19 +67,19 @@ def _score_bed_record(task):
     return row, buf.getvalue()
 
 
-def _bed_tasks(bed_info, num_reads_cff, bam_in, ref, out_path, sample_name):
+def _bed_tasks(bed_info, num_reads_cff, bam_in, ref, out_path, sample_name, plots):
     plt_li = 0
     for x in bed_info:
         known = x[-1] in ['a/', '/a', '/', 'DEL', 'a/a^', 'a^/a', 'a^/a^', 'INV', 'INS',
                           'a/aa', 'aa/a', 'aa/aa', 'DUP', 'TANDUP']
         if known:
             plt_li += 1   # figure number; the original only counted recognised records
-        yield (plt_li, x, num_reads_cff, bam_in, ref, out_path, sample_name)
+        yield (plt_li, x, num_reads_cff, bam_in, ref, out_path, sample_name, plots)
 
 
-def run_bed(bed_info, out_name, num_reads_cff, bam_in, ref, out_path, sample_name, threads=1):
+def run_bed(bed_info, out_name, num_reads_cff, bam_in, ref, out_path, sample_name, threads=1, plots=True):
     from vapor_vali import Simple_function as sf
-    tasks = _bed_tasks(bed_info, num_reads_cff, bam_in, ref, out_path, sample_name)
+    tasks = _bed_tasks(bed_info, num_reads_cff, bam_in, ref, out_path, sample_name, plots)
     with open(out_name, 'a') as fo:
         def emit(result):
             row, text = result

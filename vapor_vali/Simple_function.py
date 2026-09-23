@@ -1229,7 +1229,15 @@ def makeDotplot_subfigure(hits, title,figure_pos):
     #print "%.5f%% hits on diagonal" % (100 * len(hits2) / float(len(hits)))
     # create plot
 
+_plots_enabled=True
+
+def set_plot_output(enabled):
+    #plots are an optional by-product: skipping them changes no score (make_event_figure_1 only draws)
+    global _plots_enabled
+    _plots_enabled=bool(enabled)
+
 def make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name):
+    if not _plots_enabled: return
     nth_base = 1
     inversions = True
     if not best_read_rec=='':
