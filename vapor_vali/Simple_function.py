@@ -1,6 +1,7 @@
 from __future__ import print_function
 
-import os,sys
+import os
+import sys
 import itertools,math,random,numpy,scipy
 import matplotlib as mpl
 mpl.use('Agg')
@@ -15,6 +16,10 @@ from scipy import stats
 from scipy.stats import linregress
 from scipy.spatial import distance
 from sklearn import cluster
+try:
+    import pysam
+except ImportError:     #fall back to the samtools command line
+    pysam = None
 global invert_base
 invert_base = { 'A' : 'T', 'T' : 'A', 'C' : 'G', 'G' : 'C','N' : 'N','a' : 't', 't' : 'a', 'c' : 'g', 'g' : 'c','n' : 'n'}
 global default_flank_length
@@ -22,6 +27,7 @@ default_flank_length=500
 global default_read_length
 default_read_length=4000    #average length of pacbio read
 global default_max_sv_test
+KMEANS_SEED=0 #fixed seed: makes clustering deterministic and independent of call order (needed for caching and multiprocessing)
 default_max_sv_test=10000 #when size of a sv block excessed default_max_sv_test, try junctions instead of event
 
 def alt_seq_readin(ref,info,flank_length):
@@ -139,7 +145,7 @@ def block_modify(block,chromos):
         if len(x)==3:
             out_new_2.append(x)
         else:
-            for y in range((len(x)-1)/2):
+            for y in range(int((len(x)-1)/2)):
                 out_new_2.append([x[0],x[2*y+1],x[2*y+2]])
     return out_new_2
 
@@ -165,8 +171,10 @@ def calcu_vapor_single_read_score_abs_dis_m1(ref_seq,alt_seq,x,window_size):
     if float(len(ref_dotdata))/float(len(ref_seq))>0.1 and float(len(alt_dotdata))/float(len(alt_seq))>0.1 and float(ref_dotdata[-1][0]-ref_dotdata[0][0])/float(len(ref_seq))>0.7 and float(alt_dotdata[-1][0]-alt_dotdata[0][0])/float(len(alt_seq))>0.7:
         [ref_clean_dotdata,ref_kept_segs]=clean_dotdata_m1(ref_dotdata)
         [alt_clean_dotdata,alt_kept_segs]=clean_dotdata_m1(alt_dotdata)
-        ref_left=[i for i in ref_dotdata if not list(i) in ref_clean_dotdata]
-        alt_left=[i for i in alt_dotdata if not list(i) in alt_clean_dotdata]
+        ref_clean_set=set(tuple(i) for i in ref_clean_dotdata)
+        alt_clean_set=set(tuple(i) for i in alt_clean_dotdata)
+        ref_left=[i for i in ref_dotdata if not tuple(i) in ref_clean_set]
+        alt_left=[i for i in alt_dotdata if not tuple(i) in alt_clean_set]
         [ref_anti_diag_clean_dotdata,ref_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(ref_left)
         [alt_anti_diag_clean_dotdata,alt_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(alt_left)
         ref_clean_dotdata+=ref_anti_diag_clean_dotdata
@@ -279,8 +287,10 @@ def calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_siz
     if max([float(len(ref_dotdata))/float(len(ref_seq)),float(len(alt_dotdata))/float(len(alt_seq))])>0.1:
         [ref_clean_dotdata,ref_kept_segs]=clean_dotdata_diagnal_m1b(ref_dotdata)
         [alt_clean_dotdata,alt_kept_segs]=clean_dotdata_diagnal_m1b(alt_dotdata)
-        ref_left=[i for i in ref_dotdata if not list(i) in ref_clean_dotdata]
-        alt_left=[i for i in alt_dotdata if not list(i) in alt_clean_dotdata]
+        ref_clean_set=set(tuple(i) for i in ref_clean_dotdata)
+        alt_clean_set=set(tuple(i) for i in alt_clean_dotdata)
+        ref_left=[i for i in ref_dotdata if not tuple(i) in ref_clean_set]
+        alt_left=[i for i in alt_dotdata if not tuple(i) in alt_clean_set]
         [ref_anti_diag_clean_dotdata,ref_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(ref_left)
         [alt_anti_diag_clean_dotdata,alt_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(alt_left)
         ref_clean_dotdata+=ref_anti_diag_clean_dotdata
@@ -335,12 +345,64 @@ def cigar2alignstart_by_pos(cigar,align_start,start,end):
     else:
         return [read_rec,start_dis]
 
+_pysam_handles={}
+
+def _pysam_handle(kind,path):
+    #one handle per (process, file): handles must never be shared across forked worker processes
+    key=(os.getpid(),kind,path)
+    h=_pysam_handles.get(key,False)
+    if h is False:
+        h=None
+        if pysam is not None:
+            try:
+                h=pysam.FastaFile(path) if kind=='fasta' else pysam.AlignmentFile(path,'rb')
+            except (IOError,OSError,ValueError):
+                h=None
+        _pysam_handles[key]=h
+    return h
+
+def _plain_region(handle,chrom,start,end):
+    #True when chrom:start-end is an ordinary 1-based inclusive region on which pysam and the
+    #samtools command line agree; odd regions (start<1, end<start, unknown contig, start past the
+    #contig end) are left to samtools itself because htslib's region parser has special cases for them
+    if handle is None or not (type(start) is int and type(end) is int): return False
+    try:
+        length=handle.get_reference_length(chrom)
+    except (KeyError,ValueError):
+        return False
+    return 1<=start<=end and start<=length
+
 def chop_pacbio_read_by_pos(bam_in_new,chrom,start,end,flank_length):
+    #same result as chop_pacbio_read_by_pos_samtools, using an indexed pysam query.
+    #samtools view chrom:start-end returns records overlapping [start-1,end) (0-based) and the loop keeps
+    #those with 1-based POS<=start; those are exactly the records overlapping [start-1,start), returned in
+    #the same file order, so fetching only that one base yields the same reads without parsing the rest
+    bam=_pysam_handle('bam',bam_in_new)
+    if not _plain_region(bam,chrom,start,end):
+        return chop_pacbio_read_by_pos_samtools(bam_in_new,chrom,start,end,flank_length)
+    out=[]
+    for read in bam.fetch(chrom,start-1,start):
+        cigar=read.cigarstring
+        if cigar is None: continue      #CIGAR '*'
+        pos=read.reference_start+1
+        if pos<start+1:
+            align_info=cigar2alignstart_by_pos(cigar,pos,start,end)
+            align_start=align_info[0]
+            miss_bp=align_info[1]
+            if not miss_bp>flank_length/2:
+                seq=read.query_sequence
+                if seq is None: seq='*'
+                target_read=seq[align_start:]
+                if len(target_read)>end-start-miss_bp:
+                    out.append([target_read[:end-start-miss_bp],miss_bp,read.query_name])
+    return out
+
+def chop_pacbio_read_by_pos_samtools(bam_in_new,chrom,start,end,flank_length):
     fbam=os.popen(r'''samtools view %s %s:%d-%d'''%(bam_in_new,chrom,start,end))
     out=[]
     for line in fbam:
         pbam=line.strip().split()
-        if not pbam[0]=='@': 
+        if not pbam[0]=='@' and not pbam[5]=='*':
             if int(pbam[3])<start+1:
                 align_info=cigar2alignstart_by_pos(pbam[5],int(pbam[3]),start,end)
                 align_start=align_info[0]
@@ -438,11 +500,12 @@ def clean_dotdata_diagnal_and_anti_diagnal(ref_dotdata):
     #[kept_dot_y,removed_dot_y]=dis_cluster_2(y_axis,dis_cff=10)
     [kept_dot_diag,removed_dot_diag]=dis_cluster_2(dis_to_diagnal,dis_cff=10)
     [kept_dot_anti_diag,removed_dot_anti_diag]=dis_cluster_2(dis_to_anti_diagnal,dis_cff=10)
+    removed_both=set(removed_dot_diag)&set(removed_dot_anti_diag)
     rec=-1
     kept_dot=[]
     for x in ref_dotdata:
         rec+=1
-        if rec in removed_dot_diag and rec in removed_dot_anti_diag:   continue
+        if rec in removed_both:   continue
         else:   kept_dot.append(x)
     return kept_dot
 
@@ -504,12 +567,24 @@ def compute_bic(kmeans,X):
         else:
             cl_var.append(float(10**20) * sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
     const_term = 0.5 * m * calcu_log10(N)
+    removed_indices = find_removed_indices_with_negative(cl_var)
+    #print(n, N, d, const_term, cl_var, removed_indices)
+    n =  [arr for i, arr in enumerate(n) if i not in removed_indices]
+    cl_var = [arr for i, arr in enumerate(cl_var) if i not in removed_indices]
     BIC = np.sum([n[i] * calcu_log10(n[i]) -
            n[i] * calcu_log10(N) -
          ((n[i] * d) / 2) * calcu_log10(2*np.pi) -
           (n[i] / 2) * calcu_log10(cl_var[i]) -
-         ((n[i] - m) / 2) for i in range(m)]) - const_term
+         ((n[i] - m) / 2) for i in range(len(n))]) - const_term
     return(BIC)
+
+def find_removed_indices_with_negative(arrays):
+    removed_indices = []
+    for i, arr in enumerate(arrays):
+        arrays[i] = [0.0 if x == -0.0 else x for x in arr]
+        if any(x < 0 for x in arrays[i]):
+            removed_indices.append(i)
+    return removed_indices
 
 def dup_inv_ref_alt_bps_produce(sv_info,flank_length,alt_structure):
     bp_info=sorted(sv_info[1:3]+[sv_info[4]])
@@ -548,7 +623,8 @@ def dis_cluster(dis_to_diagnal,dis_cff=10):
     if remove_noise_1==[]:
         lenght_list=[len(i) for i in sub_group1]
         remove_noise_1=[i for i in sub_group1 if len(i)==max(lenght_list)]
-    return [[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in remove_noise_1]
+    group_sets=[set(j) for j in remove_noise_1]
+    return [[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in group_sets]
 
 def dis_cluster_2(dis_to_diagnal,dis_cff=10):
     #eg of dis_list=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 683, 854, 0, 683, 854, 0, 683, 854, 0, 683, 854, 0, 683, 0, 683, 0, 683, 0, 683, 0, 341, 512, 683, 0, 341, 512, 683, 0, 341, 512, 683, 0, 341, 512, 683, 1025, 0, 341, 512, 683, 1025, 0, 170, 341, 512, 683, 1025, 0, 170, 341, 683, 854, 1025, 0, 170, 683, 854, 1025, 0, 683, 1025, 0, 0, 0, 0, 0, 0, 0, 0, 512, 0, 512, 0, 512, 1196, 0, 170, 341, 512, 854, 1196, 1367, 0, 170, 341, 512, 854, 1196, 1367, 0]
@@ -560,9 +636,9 @@ def dis_cluster_2(dis_to_diagnal,dis_cff=10):
         else:
             sub_group1.append([i])
     remove_noise_1=[i for i in sub_group1 if len(i)>10]
-    out1=[[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in remove_noise_1]
-    out_total=[]
-    for i in out1:  out_total+=i
+    out1=[[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in [set(k) for k in remove_noise_1]]
+    out_total=set()
+    for i in out1:  out_total.update(i)
     out2=[i for i in range(len(dis_to_diagnal)) if not i in out_total]
     return [out1,out2]
 
@@ -844,8 +920,8 @@ def k_means_cluster(data_list):
     if max(data_list[0])-min(data_list[0])>10 and max(data_list[1])-min(data_list[1])>10:
         array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
         ks = list(range(1,min([5,len(data_list[0])+1])))
-        KMeans = [cluster.KMeans(n_clusters = i, init="k-means++").fit(array_diagnal) for i in ks]
-        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++").fit_predict(array_diagnal) for i in ks]
+        KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
+        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit_predict(array_diagnal) for i in ks]
         BIC=[]
         BIC_rec=[]
         for x in ks:
@@ -862,9 +938,8 @@ def k_means_cluster(data_list):
             return [data_list]
         else:
             out=[]
-            std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
             whitened = whiten(array_diagnal)
-            centroids, distortion=kmeans(whitened,ks_picked)
+            centroids, distortion=kmeans(whitened,ks_picked,seed=KMEANS_SEED)
             idx,_= vq(whitened,centroids)
             for x in range(ks_picked):
                 group1=[[int(i) for i in array_diagnal[idx==x,0]],[int(i) for i in array_diagnal[idx==x,1]]]
@@ -876,16 +951,15 @@ def k_means_cluster(data_list):
 def k_means_cluster_Predict(data_list,info):
     array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
     ks = list(range(1,len(info)))
-    KMeans = [cluster.KMeans(n_clusters = i, init="k-means++").fit(array_diagnal) for i in ks]
+    KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
     BIC = [compute_bic(kmeansi,array_diagnal) for kmeansi in KMeans]
     ks_picked=ks[BIC.index(max(BIC))]
     if ks_picked==1:
         return [data_list]
     else:
         out=[]
-        std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
         whitened = whiten(array_diagnal)
-        centroids, distortion=kmeans(whitened,ks_picked)
+        centroids, distortion=kmeans(whitened,ks_picked,seed=KMEANS_SEED)
         idx,_= vq(whitened,centroids)
         for x in range(ks_picked):
             group1=[[int(i) for i in array_diagnal[idx==x,0]],[int(i) for i in array_diagnal[idx==x,1]]]
@@ -1038,16 +1112,16 @@ def makeDotplot_subfigure(hits, title,figure_pos):
     hits2 = quality(hits)
     xlib_range=int(float(max(x))/float(10**(len(str(max(x)))-1)))+1
     if xlib_range<3:
-        xlib=[(i+1)*10**(len(str(max(x)))-1) for i in range(xlib_range)]
+        xlib=[(i+1)*float(10**(len(str(max(x)))-1)) for i in range(xlib_range)]
         xlib_new=[xlib[0]/2]
         for xi in range(len(xlib)-1):
             xlib_new.append(xlib_new[0]*(2*(xi+1)+1))
         xlib+=xlib_new
         xlib.sort()
     elif xlib_range<5:
-        xlib=[(i+1)*10**(len(str(max(x)))-1) for i in range(xlib_range)]
+        xlib=[(i+1)*float(10**(len(str(max(x)))-1)) for i in range(xlib_range)]
     else:
-        xlib=[(i+1)*2*10**(len(str(max(x)))-1) for i in range(int(xlib_range/2+1)+1)]
+        xlib=[(i+1)*2*float(10**(len(str(max(x)))-1)) for i in range(int(xlib_range/2+1)+1)]
     plt.subplot(figure_pos)
     plt.plot(x, y,'+',color='r')
     plt.xticks(xlib, [str(i) for i in xlib])
@@ -1081,7 +1155,7 @@ def minimize_pacbio_read_list(x,ideal_list_length=20):
         out=[]
         temp_hash={}
         for y in x:
-            if not y[1] in list(temp_hash.keys()):    temp_hash[y[1]]=[y]
+            if not y[1] in temp_hash:    temp_hash[y[1]]=[y]
             else:    temp_hash[y[1]]+=[y]
         for y in sorted(temp_hash.keys()):
             if len(out)<ideal_list_length:    out+=temp_hash[y]
@@ -1107,7 +1181,7 @@ def number_cluster(dis_to_diagnal_list,dis_range):
 def one_dimention_cluster_by_gap(dim1,gap,length):
     out_hash={}
     for k1 in range(len(dim1)):
-        if not dim1[k1] in list(out_hash.keys()): out_hash[dim1[k1]]=[]
+        if not dim1[k1] in out_hash: out_hash[dim1[k1]]=[]
         out_hash[dim1[k1]].append(k1)
     sorted_keys=sorted(out_hash.keys())
     out=[[sorted_keys[0]]]
@@ -1124,7 +1198,7 @@ def one_dimention_cluster_by_gap(dim1,gap,length):
 
 def path_mkdir(path):
     if not os.path.isdir(path):
-        os.system(r'''mkdir %s'''%(path))
+        os.makedirs(path)
 
 def path_modify(path):
     if not path[-1]=='/':
@@ -1190,6 +1264,19 @@ def ref_deviate_lines_calcu(list_dotdata):
 def ref_seq_readin(ref,chrom,start,end,reverse_flag='FALSE'):
     #reverse=='TRUE': return rev-comp-seq   ; if not specified, default as 'FALSE'
     #else: return original seq
+    #same result as ref_seq_readin_samtools (samtools faidx ref chrom:start-end) via an open pysam handle
+    start=int(start)
+    end=int(end)
+    fa=_pysam_handle('fasta',ref)
+    if not _plain_region(fa,chrom,start,end):
+        return ref_seq_readin_samtools(ref,chrom,start,end,reverse_flag)
+    seq=fa.fetch(chrom,start-1,end)
+    if reverse_flag=='FALSE':
+        return seq
+    else:
+        return reverse(complementary(seq))
+
+def ref_seq_readin_samtools(ref,chrom,start,end,reverse_flag='FALSE'):
     fref=os.popen(r'''samtools faidx %s %s:%d-%d'''%(ref,chrom,int(start),int(end)))
     fref.readline().strip().split()
     seq=''
@@ -1205,9 +1292,9 @@ def ref_seq_readin(ref,chrom,start,end,reverse_flag='FALSE'):
 
 def result_organize_ins(info_list):
     #eg of info_list=[key_event,vapor_score_event]=['chr2_82961201', [-9.228366096827557, -106.46718851834126, -667.0858781654538, -38.56838396416415, -64.87185751169045, -147.77261544769615, -28.29536680099185, -25.378519434143666, -17.23542013374081, -113.00564782332029, -64.53043553409316]]
-    if len(info_list[1])>1:
-        pos_values=[i for i in info_list[1] if float(i)>0.1]
-        neg_values=[i for i in info_list[1] if not float(i)>0.1]
+    if len(info_list[1])>0:
+        pos_values=[i for i in info_list[1] if float(i)>0]
+        neg_values=[i for i in info_list[1] if not float(i)>0]
         geno_value=float(len(pos_values))/float(len(pos_values)+len(neg_values))
         if not pos_values==[]:
             qual_value=np.mean(pos_values)
@@ -1443,8 +1530,8 @@ def sv_insert_point_define(pin):
     return svtype
 
 def take_off_symmetric_dots(list_dotdata):
-    left_part=[list_dotdata[i] for i in range(len(list_dotdata)/2)]
-    right_part=[list_dotdata[i][::-1] for i in [len(list_dotdata)-1-i for i in range(len(list_dotdata)/2)]]
+    left_part=[list_dotdata[i] for i in range(int(len(list_dotdata)/2))]
+    right_part=[list_dotdata[i][::-1] for i in [len(list_dotdata)-1-i for i in range(int(len(list_dotdata)/2))]]
     left_new=[i for i in left_part if eu_dis_single_dot(i)>0.15]
     right_new=[i for i in right_part if eu_dis_single_dot(i)>0.15]
     sym_dots=[]
@@ -1572,7 +1659,7 @@ def vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
                             vapor_score_list=vapor_long_del_inv(bam_in,ref,sv_info,out_figure_name)
         else:
             if len(sv_info)==2 and [i[-1] for i in sv_info]==['del','inv']:
-                vapor_score_list=vapor_long_del_inv(bam_in,ref,sv_info,out_figure_name)
+                vapor_score_list=vapor_long_del_inv(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
     else:
         for sub_sv_info in sv_info:
             if 'del' in sub_sv_info:    vapor_score_list+=vapor_simple_del_Vapor(bam_in,ref,sub_sv_info[:-1],'.'.join(out_figure_name.split('.')[:-1])+'_'.join([str(i) for i in sub_sv_info])+'.'+out_figure_name.split('.')[-1])
@@ -1684,7 +1771,6 @@ def write_test_data(file_out,ref_dotdata,alt_dotdata):
     fo=open(file_out+'.alt','w')
     for i in alt_dotdata:    print('\t'.join([str(j) for j in i]), file=fo)
     fo.close()
-
 
 def vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
     #eg of sv_info=['chr1', 101553562, 101553905]
@@ -2066,7 +2152,7 @@ def log_likelihood_calcu(k,l,m,g,err=0.05):
 
 def write_output_initiate(out_name):
     fo=open(out_name,'w')
-    print('\t'.join(['chr','start','end','SV_description','VaPoR_qs','VaPoR_gs','VaPoR_GT','VaPoR_GQ','VaPoR_Rec']), file=fo)
+    print('\t'.join(['#CHR','POS','END','SVTYPE','SVID','VaPoR_QS','VaPoR_GS','VaPoR_GT','VaPoR_GQ','VaPoR_Rec']), file=fo)
     fo.close()
 
 def write_output_main(out_name,out_list):
@@ -2099,6 +2185,6 @@ def X_means_cluster(data_list):
 def X_means_cluster_reformat(data_list):
     out=X_means_cluster(data_list)
     out2=[]
-    for y in range(len(out)/2):
+    for y in range(int(len(out)/2)):
         out2.append([out[2*y],out[2*y+1]])
     return out2

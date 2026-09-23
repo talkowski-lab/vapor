@@ -1,0 +1,8 @@
+.venv/
+work/
+test_data/
+build/
+*.egg-info/
+__pycache__/
+*.so
+.idea/
