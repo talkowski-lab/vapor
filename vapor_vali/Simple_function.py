@@ -1244,7 +1244,8 @@ def make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_se
                 makeDotplot_subfigure(hits_alt_alt,'alt vs. alt',222)
                 makeDotplot_subfigure(hits_ref,'read vs. ref',223)
                 makeDotplot_subfigure(hits_alt,'read vs. alt',224)
-                plt.savefig(out_figure_name)
+                #fig.savefig writes the same file as plt.savefig, without the extra redraw pyplot performs after saving
+                fig.savefig(out_figure_name)
                 #plt.show()
                 plt.close(fig)
 
