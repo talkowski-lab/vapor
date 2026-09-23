@@ -267,229 +267,201 @@ def svelter_readin(file_in):
 	fin.close()
 	return out_hash
 
-if len(sys.argv)<2: 
-	import vapor_vali.prep as prep
-	prep.print_read_me()
-else:
-	import getopt,scipy,random,math
-	from numpy import vstack,array
-	from numpy.random import rand
-	from scipy.cluster.vq import vq, kmeans, whiten
-	from scipy import stats
-	from scipy.stats import linregress
-	from sklearn import cluster
-	from scipy.spatial import distance
-	import sklearn.datasets
-	from sklearn.preprocessing import StandardScaler
-	function_name=sys.argv[1]
-	global dict_opts,num_reads_cff
+# guard: multiprocessing workers started with 'spawn' import this file and must not rerun it
+if __name__ == '__main__':
+	from vapor_vali.parallel import limit_native_threads
+	limit_native_threads()
+	if len(sys.argv)<2: 
+		import vapor_vali.prep as prep
+		prep.print_read_me()
+	else:
+		import getopt,scipy,random,math
+		from numpy import vstack,array
+		from numpy.random import rand
+		from scipy.cluster.vq import vq, kmeans, whiten
+		from scipy import stats
+		from scipy.stats import linregress
+		from sklearn import cluster
+		from scipy.spatial import distance
+		import sklearn.datasets
+		from sklearn.preprocessing import StandardScaler
+		function_name=sys.argv[1]
+		global dict_opts,num_reads_cff
 
-	parser = argparse.ArgumentParser(
-			description=__doc__,
-			formatter_class=argparse.RawDescriptionHelpFormatter)
-	parser.add_argument('--sv-input', required=True, help='input file of SV calls')
-	parser.add_argument('--reference', required=True, help='reference sequences')
-	parser.add_argument('--pacbio-input', required=True, help='input pacbio sequences in bam format')
-	parser.add_argument('--output-path', required=True, help='path of output VaPoR figures')
-	parser.add_argument('--output-file', required=True, help = 'name of output file')
-	parser.add_argument('--PB-supp', required=False, help='minimum number of evaluable PacBio reads')
-	args = parser.parse_args(sys.argv[2:])
+		parser = argparse.ArgumentParser(
+				description=__doc__,
+				formatter_class=argparse.RawDescriptionHelpFormatter)
+		parser.add_argument('--sv-input', required=True, help='input file of SV calls')
+		parser.add_argument('--reference', required=True, help='reference sequences')
+		parser.add_argument('--pacbio-input', required=True, help='input pacbio sequences in bam format')
+		parser.add_argument('--output-path', required=True, help='path of output VaPoR figures')
+		parser.add_argument('--output-file', required=True, help = 'name of output file')
+		parser.add_argument('--PB-supp', required=False, help='minimum number of evaluable PacBio reads')
+		parser.add_argument('--threads', required=False, type=int, default=1, help='number of worker processes for the bed mode (default 1)')
+		args = parser.parse_args(sys.argv[2:])
 
-	if function_name=='ins':
-		if len(sys.argv)==2:
-			import vapor_vali.prep as prep
-			prep.readme_melt()
-		else:
-			from vapor_vali.Simple_function import *
-			def main():
+		if function_name=='ins':
+			if len(sys.argv)==2:
+				import vapor_vali.prep as prep
+				prep.readme_melt()
+			else:
+				from vapor_vali.Simple_function import *
+				def main():
+					num_reads_cff=3
+					if args.PB_supp:
+						num_reads_cff = int(args.PB_supp)
+					out_path=args.output_path
+					path_mkdir(out_path)
+					melt_input_prefix=args.sv_input_prefix
+					sample_name=melt_input_prefix.split('/')[-1].split('.')[0]
+					bam_in=args.pacbio_input
+					ref=args.reference
+					melt_info_readin(melt_input_prefix,out_path,sample_name,bam_in,ref)
+				main()
+		elif function_name=='bed':
+			if len(sys.argv)==2:
+				import vapor_vali.prep as prep
+				prep.readme_bed()
+			else:
+				#requirement for bed format: chr start end sv_type; format of sv_type: INS_280/ DEL_1_0/ DUP_<CN2>_<CN1>
+				from vapor_vali.Simple_function import *
+				[out_name, out_path, bed_input, sample_name, bam_in, ref] = [args.output_file, args.output_path,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),args.pacbio_input,args.reference]
+
 				num_reads_cff=3
 				if args.PB_supp:
 					num_reads_cff = int(args.PB_supp)
-				out_path=args.output_path
+
+				out_path=path_modify(out_path)
 				path_mkdir(out_path)
-				melt_input_prefix=args.sv_input_prefix
-				sample_name=melt_input_prefix.split('/')[-1].split('.')[0]
-				bam_in=args.pacbio_input
-				ref=args.reference
-				melt_info_readin(melt_input_prefix,out_path,sample_name,bam_in,ref)
-			main()
-	elif function_name=='bed':
-		if len(sys.argv)==2:
-			import vapor_vali.prep as prep
-			prep.readme_bed()
-		else:
-			#requirement for bed format: chr start end sv_type; format of sv_type: INS_280/ DEL_1_0/ DUP_<CN2>_<CN1>
+				bed_info=bed_info_readin(bed_input,out_path)
+				write_output_initiate(out_name)
+				from vapor_vali.parallel import run_bed
+				run_bed(bed_info,out_name,num_reads_cff,bam_in,ref,out_path,sample_name,threads=args.threads)
+		elif function_name=='vcf':
+			if len(sys.argv)==2:
+				import vapor_vali.prep as prep
+				prep.readme_vcf()
+			else:
+				#command='vapor vcf --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.vcf --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.vcf.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
+				from vapor_vali.Simple_function import *
+
+				[ref,vcf_input,sample_name,out_path,bam_in] = [args.reference,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),path_modify(args.output_path),args.pacbio_input]
+
+				num_reads_cff=3
+				if args.PB_supp:
+					num_reads_cff = int(args.PB_supp)
+
+				path_mkdir(out_path)
+				[vcf_list,vcf_rec_hash]=vcf_list_readin(vcf_input)
+				vcf_rec_hash_new=vcf_rec_hash_modify(vcf_rec_hash)
+				write_output_initiate(vcf_input+'.vapor')
+				plt_li=0
+				for x in list(vcf_list.keys()):
+					if x=='DEL':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								#eg of y=['chr1', '91666237', '91667096']
+								if y[2]-y[1]<50: 
+									key_event=':'.join([str(i) for i in y]+['DEL'])
+									plt_li+=1
+									vapor_score_event=[]
+									write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+								else:
+									key_event=':'.join([str(i) for i in y]+['DEL'])
+									plt_li+=1
+									vapor_score_event=vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DEL.'+key_event.replace(':','__')+'.png')
+									write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='INV':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								#eg of y=['chr1', '91666237', '91667096']
+								if y[2]-y[1]<50: 
+									key_event=':'.join([str(i) for i in y]+['DEL'])
+									plt_li+=1
+									vapor_score_event=[]
+									write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+								else:
+									key_event=':'.join([str(i) for i in y]+['INV'])
+									plt_li+=1
+									vapor_score_event=vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.INV.'+key_event.replace(':','__')+'.png')
+									write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='INS':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								key_event=':'.join([str(i) for i in y[:3]+['INS']])
+								ins_pos='_'.join([str(i) for i in y[:2]])
+								POLARITY='+'
+								if len(y)==4:			ins_seq=y[-1]
+								else:					ins_seq=''.join(['X' for i in range(y[2])])
+								plt_li+=1
+								vapor_score_event=vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_path+sample_name+'.INS.'+key_event.replace(':','__')+'.png',POLARITY)
+								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='DISDUP':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								key_event=':'.join([str(i) for i in y+['DISDUP']])
+								plt_li+=1
+								vapor_score_event=vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DISDUP.'+key_event.replace(':','__')+'.png')
+								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='DEL_INV':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								key_event=':'.join(['_'.join([str(i) for i in j]) for j in y]+['DEL_INV'])
+								plt_li+=1
+								vapor_score_event=vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DEL_INV.'+key_event.replace(':','__')+'.png')
+								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='DUP_INV':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								#y=['chr7', '121522364', '121522527', 'chr7', '121522527']
+								key_event=':'.join([str(i) for i in y+['DUP_INV']])
+								plt_li+=1
+								vapor_score_event=vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DUP_INV.'+key_event.replace(':','__')+'.png')
+								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					elif x=='Other':
+						for y in vcf_list[x]:
+							if not 'NA' in y:
+								print (y)
+								#eg of y=['ab_ab', 'ab_bb^', 'chr15', '95148444', '95149304', '95149530']
+								key_event=':'.join([str(i) for i in y+['CANNOT_CLASSIFY']])
+								plt_li+=1
+								vapor_score_event=vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.CANNOT_CLASSIFY.'+key_event.replace(':','__')+'.png')
+								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
+					else:
+						print (x)
+				vcf_vapor_modify(vcf_input,vcf_rec_hash_new)
+		elif function_name=='svelter':
+			#command='vapor svelter --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/SVelter.version16/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.svelter --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/SVelter.version16/HG00512.svelter.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
+			#command='vapor svelter --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.vcf --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.vcf.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
 			from vapor_vali.Simple_function import *
-			[out_name, out_path, bed_input, sample_name, bam_in, ref] = [args.output_file, args.output_path,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),args.pacbio_input,args.reference]
+
+			[ref,svelter_input,sample_name,out_path,bam_in] = [args.reference,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),path_modify(args.output_path),args.pacbio_input]
 
 			num_reads_cff=3
 			if args.PB_supp:
 				num_reads_cff = int(args.PB_supp)
 
-			out_path=path_modify(out_path)
 			path_mkdir(out_path)
-			bed_info=bed_info_readin(bed_input,out_path)
-			write_output_initiate(out_name)
-			plt_li=0
-			for x in bed_info:
-				if x[-1] in ['a/','/a','/','DEL']:
-					key_event=':'.join([str(i) for i in x[:-3]]+['DEL'])
-					plt_li+=1
-					vapor_score_event=vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,x[:-3],out_path+sample_name+'.DEL.'+key_event.replace(':','__')+'.png')
-					vapor_result=result_organize_ins([key_event,vapor_score_event])
-					write_output_main(out_name,vapor_result[0].split(':')+[x[3]]+vapor_result[1:])
-					print (vapor_result)
-				elif x[-1] in ['a/a^','a^/a','a^/a^','INV']:	
-					key_event=':'.join([str(i) for i in x[:-3]]+['INV'])
-					plt_li+=1
-					vapor_score_event=vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,x[:-3],out_path+sample_name+'.INV.'+key_event.replace(':','__')+'.png')
-					vapor_result=result_organize_ins([key_event,vapor_score_event])
-					write_output_main(out_name,vapor_result[0].split(':')+[x[3]]+vapor_result[1:])
-					print (vapor_result)
-				elif x[-1] in ['INS']:
-					key_event=':'.join([str(i) for i in x[:-3]+['INS']])
-					plt_li+=1
-					ins_pos='_'.join([str(i) for i in x[:2]])
-					POLARITY='+'
-					if type(x[4])==type(4):					ins_seq=''.join(['X' for i in range(x[4])])
-					else:									ins_seq=x[4]
-					vapor_score_event=vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_path+sample_name+'.INS.'+key_event.replace(':','__')+'.png',POLARITY)
-					vapor_result=result_organize_ins([key_event,vapor_score_event])
-					write_output_main(out_name,vapor_result[0].split(':')+[x[3]]+vapor_result[1:])
-					print (vapor_result)
-				elif x[-1] in ['a/aa','aa/a','aa/aa','DUP','TANDUP']:
-					key_event=':'.join([str(i) for i in x[:-3]]+['TANDUP'])
-					plt_li+=1
-					vapor_score_event=vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,x[:-3],out_path+sample_name+'.TANDUP.'+key_event.replace(':','__')+'.png')
-					vapor_result=result_organize_ins([key_event,vapor_score_event])
-					write_output_main(out_name,vapor_result[0].split(':')+[x[3]]+vapor_result[1:])
-					print (vapor_result)
-				else:	print (x)
-	elif function_name=='vcf':
-		if len(sys.argv)==2:
-			import vapor_vali.prep as prep
-			prep.readme_vcf()
-		else:
-			#command='vapor vcf --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.vcf --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.vcf.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
-			from vapor_vali.Simple_function import *
-
-			[ref,vcf_input,sample_name,out_path,bam_in] = [args.reference,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),path_modify(args.output_path),args.pacbio_input]
-
-			num_reads_cff=3
-			if args.PB_supp:
-				num_reads_cff = int(args.PB_supp)
-
-			path_mkdir(out_path)
-			[vcf_list,vcf_rec_hash]=vcf_list_readin(vcf_input)
-			vcf_rec_hash_new=vcf_rec_hash_modify(vcf_rec_hash)
-			write_output_initiate(vcf_input+'.vapor')
-			plt_li=0
-			for x in list(vcf_list.keys()):
-				if x=='DEL':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							#eg of y=['chr1', '91666237', '91667096']
-							if y[2]-y[1]<50: 
-								key_event=':'.join([str(i) for i in y]+['DEL'])
-								plt_li+=1
-								vapor_score_event=[]
-								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-							else:
-								key_event=':'.join([str(i) for i in y]+['DEL'])
-								plt_li+=1
-								vapor_score_event=vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DEL.'+key_event.replace(':','__')+'.png')
-								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='INV':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							#eg of y=['chr1', '91666237', '91667096']
-							if y[2]-y[1]<50: 
-								key_event=':'.join([str(i) for i in y]+['DEL'])
-								plt_li+=1
-								vapor_score_event=[]
-								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-							else:
-								key_event=':'.join([str(i) for i in y]+['INV'])
-								plt_li+=1
-								vapor_score_event=vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.INV.'+key_event.replace(':','__')+'.png')
-								write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='INS':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							key_event=':'.join([str(i) for i in y[:3]+['INS']])
-							ins_pos='_'.join([str(i) for i in y[:2]])
-							POLARITY='+'
-							if len(y)==4:			ins_seq=y[-1]
-							else:					ins_seq=''.join(['X' for i in range(y[2])])
-							plt_li+=1
-							vapor_score_event=vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_path+sample_name+'.INS.'+key_event.replace(':','__')+'.png',POLARITY)
-							write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='DISDUP':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							key_event=':'.join([str(i) for i in y+['DISDUP']])
-							plt_li+=1
-							vapor_score_event=vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DISDUP.'+key_event.replace(':','__')+'.png')
-							write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='DEL_INV':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							key_event=':'.join(['_'.join([str(i) for i in j]) for j in y]+['DEL_INV'])
-							plt_li+=1
-							vapor_score_event=vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DEL_INV.'+key_event.replace(':','__')+'.png')
-							write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='DUP_INV':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							#y=['chr7', '121522364', '121522527', 'chr7', '121522527']
-							key_event=':'.join([str(i) for i in y+['DUP_INV']])
-							plt_li+=1
-							vapor_score_event=vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.DUP_INV.'+key_event.replace(':','__')+'.png')
-							write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				elif x=='Other':
-					for y in vcf_list[x]:
-						if not 'NA' in y:
-							print (y)
-							#eg of y=['ab_ab', 'ab_bb^', 'chr15', '95148444', '95149304', '95149530']
-							key_event=':'.join([str(i) for i in y+['CANNOT_CLASSIFY']])
-							plt_li+=1
-							vapor_score_event=vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,y,out_path+sample_name+'.CANNOT_CLASSIFY.'+key_event.replace(':','__')+'.png')
-							write_output_main(vcf_input+'.vapor',result_organize_ins([key_event,vapor_score_event]))
-				else:
-					print (x)
-			vcf_vapor_modify(vcf_input,vcf_rec_hash_new)
-	elif function_name=='svelter':
-		#command='vapor svelter --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/SVelter.version16/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.svelter --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/SVelter.version16/HG00512.svelter.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
-		#command='vapor svelter --sv-input /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.alt_bwamem_GRCh38DH.20150715.CHS.high_coverage.vcf --output-path /scratch/remills_flux/xuefzhao/SV_discovery_index/download/HG00512.vcf.vapor/  --reference /scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa --pacbio-input /nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
-		from vapor_vali.Simple_function import *
-
-		[ref,svelter_input,sample_name,out_path,bam_in] = [args.reference,args.sv_input,'.'.join(args.sv_input.split('/')[-1].split('.')[:-1]),path_modify(args.output_path),args.pacbio_input]
-
-		num_reads_cff=3
-		if args.PB_supp:
-			num_reads_cff = int(args.PB_supp)
-
-		path_mkdir(out_path)
-		svelter_hash=svelter_readin(svelter_input)
-		#Command_parametre_readin()
-		plt_li = 0
-		for k1 in list(svelter_hash.keys()):
-			for k2 in list(svelter_hash[k1].keys()):
-				for k3 in svelter_hash[k1][k2]:
-					plt_li+=1
-					key_event = '.'+'_'.join(k3)
-					out_figure_name = out_path+sample_name+key_event.replace(':','__')+'.png'
-					#eg of sv_info=['ab_ab', 'b_b^', 'chr7', '70955990', '70961199', '70973901']
-					sv_info = [k1,k2]+k3
-					print(sv_info)
-					vapor_score_event=vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
-					write_output_main(args.output_file,result_organize_ins([key_event,vapor_score_event]))
+			svelter_hash=svelter_readin(svelter_input)
+			#Command_parametre_readin()
+			plt_li = 0
+			for k1 in list(svelter_hash.keys()):
+				for k2 in list(svelter_hash[k1].keys()):
+					for k3 in svelter_hash[k1][k2]:
+						plt_li+=1
+						key_event = '.'+'_'.join(k3)
+						out_figure_name = out_path+sample_name+key_event.replace(':','__')+'.png'
+						#eg of sv_info=['ab_ab', 'b_b^', 'chr7', '70955990', '70961199', '70973901']
+						sv_info = [k1,k2]+k3
+						print(sv_info)
+						vapor_score_event=vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
+						write_output_main(args.output_file,result_organize_ins([key_event,vapor_score_event]))
 
 
 

@@ -615,10 +615,23 @@ def dup_inv_dup_bps_produce(sv_info,flank_length,alt_structure):
     else:
         return [alt_bps_new[1:3],alt_bps_new[3:5]]
 
+_dotdata_cache={}
+
+def dotdata_cache_clear():
+    #called at the start of every SV so that cached hit lists never outlive the SV they belong to
+    _dotdata_cache.clear()
+
 def dotdata(kmerlen,seq1, seq2):
-    nth_base = 1
-    inversions = True
-    hits = kmerhits(seq1, seq2, kmerlen, nth_base, inversions)
+    #dotdata is a pure function of its arguments and callers never modify the returned list, so the same
+    #hit list is reused whenever an SV asks for the same dot plot again (the second deletion scorer, the
+    #final window size of window_size_refine, and the four panels of make_event_figure_1)
+    key=(kmerlen,seq1,seq2)
+    hits=_dotdata_cache.get(key)
+    if hits is None:
+        nth_base = 1
+        inversions = True
+        hits = kmerhits(seq1, seq2, kmerlen, nth_base, inversions)
+        _dotdata_cache[key]=hits
     return hits
 
 def dis_cluster(dis_to_diagnal,dis_cff=10):
@@ -1022,7 +1035,80 @@ def key_modify(key):
             key=key.replace('v','n')
     return key
 
+#k-mer alphabet after key_modify: IUPAC codes R,Y,S,W,K,M,B,D,H,V become N (n for lower case)
+_KMER_ALPHABET='ACGTNacgtn'
+_KMER_OTHER=15
+_kmer_code=np.full(256,_KMER_OTHER,dtype=np.uint64)
+for _i,_c in enumerate(_KMER_ALPHABET): _kmer_code[ord(_c)]=_i
+for _c in 'RYSWKMBDHV':
+    _kmer_code[ord(_c)]=_KMER_ALPHABET.index('N')
+    _kmer_code[ord(_c.lower())]=_KMER_ALPHABET.index('n')
+#complement of each alphabet code (invert_base): A<->T, C<->G, N->N, same for lower case
+_kmer_comp=np.array([_KMER_ALPHABET.index(invert_base[c]) for c in _KMER_ALPHABET],dtype=np.uint64)
+
+def _kmer_ids_packed(codes,kmerlen):
+    #pack every k-mer window of a code array (4 bits per base) into ceil(k/16) uint64 words
+    win=np.lib.stride_tricks.sliding_window_view(codes,kmerlen)
+    words=[]
+    for a in range(0,kmerlen,16):
+        b=min(a+16,kmerlen)
+        shifts=np.arange(b-a,dtype=np.uint64)*np.uint64(4)
+        words.append((win[:,a:b]<<shifts).sum(axis=1,dtype=np.uint64))
+    return np.stack(words,axis=1)
+
 def kmerhits(seq1, seq2, kmerlen, nth_base=1, inversions=False):
+    #vectorised equivalent of kmerhits_python for the only configuration used (every base, inversions of
+    #seq1 only, exact matches). It returns the identical list: for every seq2 position i (ascending) and
+    #every seq1 position j (ascending) whose k-mer or reverse-complemented k-mer equals the seq2 k-mer, the
+    #tuple (i, j); a palindromic k-mer, which matches both ways, yields (i, j) twice, as in the original.
+    #Anything else, including sequences whose reverse complement would raise KeyError, uses the original.
+    if not (nth_base==1 and inversions and kmerlen<=40 and kmerlen>0):
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    n1=len(seq1)-kmerlen+1
+    n2=len(seq2)-kmerlen+1
+    if n1<=0 or n2<=0:
+        return []
+    try:
+        b1=seq1.encode('ascii')
+        b2=seq2.encode('ascii')
+    except UnicodeEncodeError:
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    c1=_kmer_code[np.frombuffer(b1,dtype=np.uint8)]
+    if (c1==_KMER_OTHER).any():     #invert_base lookup of the original raises KeyError here
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    c2=_kmer_code[np.frombuffer(b2,dtype=np.uint8)]
+    fwd=_kmer_ids_packed(c1,kmerlen)
+    rc=_kmer_ids_packed(_kmer_comp[c1][::-1].copy(),kmerlen)[::-1]   #row j: reverse complement of k-mer j
+    qry=_kmer_ids_packed(np.minimum(c2,np.uint64(_KMER_ALPHABET.index('n'))),kmerlen)
+    #seq2 k-mers holding a character outside the alphabet can never match (seq1 k-mers never contain one)
+    bad=np.lib.stride_tricks.sliding_window_view(c2==_KMER_OTHER,kmerlen).any(axis=1)
+    allk=np.concatenate([fwd,rc,qry])
+    _,ids=np.unique(allk,axis=0,return_inverse=True)
+    ids=ids.reshape(-1)
+    fwd_id=ids[:n1]
+    rc_id=ids[n1:2*n1]
+    q_id=ids[2*n1:]
+    #lookup table entries (k-mer id, seq1 position); sorted by id then position like the original lists
+    ent_id=np.concatenate([fwd_id,rc_id])
+    ent_pos=np.concatenate([np.arange(n1),np.arange(n1)])
+    order=np.lexsort((ent_pos,ent_id))
+    ent_id=ent_id[order]
+    ent_pos=ent_pos[order]
+    lo=np.searchsorted(ent_id,q_id,side='left')
+    hi=np.searchsorted(ent_id,q_id,side='right')
+    cnt=hi-lo
+    cnt[bad]=0
+    total=int(cnt.sum())
+    if total==0:
+        return []
+    qi=np.repeat(np.arange(n2),cnt)
+    first=np.cumsum(cnt)-cnt
+    offs=np.arange(total)-np.repeat(first,cnt)
+    pj=ent_pos[np.repeat(lo,cnt)+offs]
+    return list(zip(qi.tolist(),pj.tolist()))
+
+def kmerhits_python(seq1, seq2, kmerlen, nth_base=1, inversions=False):
+    #original pure-Python implementation, kept as the reference and for configurations kmerhits does not cover
     # hash table for finding hits
     lookup = {}
     # store sequence hashes in hash table
@@ -1575,6 +1661,7 @@ def unify_list(list):
     return out
 
 def vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['ab_ab', 'b_b^', 'chr7', '70955990', '70961199', '70973901']
     ref_sv=sv_info[0].split('_')
     alt_sv=list_unify([i for i in sv_info[1].split('_') if not i in ref_sv])
@@ -1642,6 +1729,7 @@ def vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figu
     return vapor_score_list
 
 def vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     sv_block=[sv_info[0][0],sv_info[0][1],sv_info[-1][2]]
     flank_length=flank_length_calculate(sv_block)
     vapor_score_list=[]
@@ -1680,6 +1768,7 @@ def vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
     return vapor_score_list
 
 def vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['chr1', 114103333, 114103408, 'chr1', 114111746]
     sv_info[1:3]=[int(i) for i in sv_info[1:3]]
     dup_block=sv_info[:3]
@@ -1756,6 +1845,7 @@ def vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
     return vapor_score_list
 
 def vapor_long_del_inv(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=[['chr19', 46275941, 46314150, 'del'], ['chr19', 46314150, 46314312, 'inv']]
     vapor_score_list=[]
     best_read_rec=''
@@ -1786,6 +1876,7 @@ def write_test_data(file_out,ref_dotdata,alt_dotdata):
     fo.close()
 
 def vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['chr1', 101553562, 101553905]
     flank_length=flank_length_calculate(sv_info)
     vapor_score_list=[]
@@ -1832,6 +1923,7 @@ def vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_na
     return vapor_score_list
 
 def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
    #vapor_simple_del_Vapor(bam_in,ref,x[:-2],out_path+sample_name+'.TANDUP.'+key_event+'.png')
     flank_length=flank_length_calculate(sv_info)
     vapor_score_list=[]
@@ -1870,6 +1962,7 @@ def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
     return vapor_score_list
 
 def vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     sv_info[1:3]=[int(i) for i in sv_info[1:3]]
     dup_block=sv_info[:3]
     ins_point=[sv_info[3],int(sv_info[4])]
@@ -1940,6 +2033,7 @@ def vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
     return vapor_score_list
 
 def vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_figure_name,POLARITY):
+    dotdata_cache_clear()
     #eg of ins_pos='chr1_83144055'
     #eg of bam_in='/nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
     #eg of ref='/scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa'
@@ -1979,6 +2073,7 @@ def vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_f
     return vapor_score_list
 
 def vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #vapor_simple_inv_Vapor(bam_in,ref,y,out_path+sample_name+'.INV.'+key_event+'.png')
     #eg of sv_info=['chr1', 101553562, 101553905]
     flank_length=flank_length_calculate(sv_info)
@@ -2169,9 +2264,13 @@ def write_output_initiate(out_name):
 
 def write_output_main(out_name,out_list):
     fo=open(out_name,'a')
+    write_output_row(fo,out_list)
+    fo.close()
+
+def write_output_row(fo,out_list):
+    #write_output_main on an already open file
     if not 'NA' in out_list:    print('\t'.join([str(i) for i in out_list[:-1]+gt_estimate_log_likelihood(out_list)+[out_list[-1]]]), file=fo)
     else:                       print('\t'.join([str(i) for i in out_list[:-1]+['NA','NA','NA']]), file=fo)
-    fo.close()
 
 def x_to_x_modify_new(x,dup_block_combined):
     x_modify=[[i] for i in list(x)]
