@@ -16,8 +16,9 @@ setup(
        ],
    },
     install_requires=[
-     'numpy', 'scipy', 'matplotlib', 'scikit-learn'
+     'numpy', 'scipy', 'matplotlib', 'scikit-learn', 'pysam'
       ],
+    python_requires='>=3.8',
     license="Propriety",
     keywords="Long read",
     classifiers=[
