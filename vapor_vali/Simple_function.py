@@ -381,7 +381,12 @@ def chop_pacbio_read_by_pos(bam_in_new,chrom,start,end,flank_length):
     if not _plain_region(bam,chrom,start,end):
         return chop_pacbio_read_by_pos_samtools(bam_in_new,chrom,start,end,flank_length)
     out=[]
+    #a read is kept only if miss_bp<=flank_length/2 and len(read[align_start:])>end-start-miss_bp, which
+    #needs len(read)>end-start-flank_length/2; shorter reads can be skipped without parsing their CIGAR
+    min_len=end-start-flank_length/2
     for read in bam.fetch(chrom,start-1,start):
+        qlen=read.query_length
+        if (qlen if qlen>0 else 1)<=min_len: continue      #SEQ '*' is a one-character read
         cigar=read.cigarstring
         if cigar is None: continue      #CIGAR '*'
         pos=read.reference_start+1
@@ -539,6 +544,12 @@ def complementary(seq):
                     seq2.append('atgcn'['tacgn'.index(i)])
     return ''.join(seq2)
 
+def _sequential_row_sum(a):
+    #bit-identical to the builtin sum(a) over the rows of a 2-D array: np.cumsum adds strictly left to
+    #right (unlike np.sum, which uses pairwise summation and can differ in the last bit)
+    if len(a)==0: return 0
+    return np.cumsum(a,axis=0)[-1]
+
 def compute_bic(kmeans,X):
     """
     Computes the BIC metric for a given clusters
@@ -563,9 +574,9 @@ def compute_bic(kmeans,X):
     cl_var=[]
     for i in range(m):
         if not n[i] - m==0:
-            cl_var.append((1.0 / (n[i] - m)) * sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
+            cl_var.append((1.0 / (n[i] - m)) * _sequential_row_sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
         else:
-            cl_var.append(float(10**20) * sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
+            cl_var.append(float(10**20) * _sequential_row_sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
     const_term = 0.5 * m * calcu_log10(N)
     removed_indices = find_removed_indices_with_negative(cl_var)
     #print(n, N, d, const_term, cl_var, removed_indices)
@@ -918,10 +929,12 @@ def kept_lines_size_filter(size_list,square_size=400):
 
 def k_means_cluster(data_list):
     if max(data_list[0])-min(data_list[0])>10 and max(data_list[1])-min(data_list[1])>10:
-        array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
+        #same int64 C-ordered array as np.array([[x0,y0],[x1,y1],...]), built without the per-point lists
+        array_diagnal=np.ascontiguousarray(np.array([data_list[0],data_list[1]]).T)
         ks = list(range(1,min([5,len(data_list[0])+1])))
         KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
-        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit_predict(array_diagnal) for i in ks]
+        #a second identically seeded fit_predict returns exactly fit().labels_, so reuse it
+        KMeans_predict=[km.labels_ for km in KMeans]
         BIC=[]
         BIC_rec=[]
         for x in ks:
@@ -1824,14 +1837,14 @@ def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
     vapor_score_list=[]
     best_read_rec=''
     if sv_info[2]-sv_info[1]<default_max_sv_test: #only try to read in all reads with sv <100K; else: try breakpoints ; 
+        #reads first, window size only when needed (see vapor_simple_inv_Vapor)
         ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[2]+flank_length)
-        [window_size,window_size_qc]=window_size_refine(ref_seq)
-        if not window_size=='Error':
+        all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info[:2]+[sv_info[1]+2*(sv_info[2]-sv_info[1])],flank_length)
+        if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
             alt_seq=ref_seq[:flank_length]+ref_seq[flank_length:(-flank_length)]+ref_seq[flank_length:(-flank_length)]+ref_seq[-flank_length:]
             [window_size,window_size_qc]=window_size_refine(alt_seq)
             if not window_size=='Error':
-                all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info[:2]+[sv_info[1]+2*(sv_info[2]-sv_info[1])],flank_length)
-                if len(all_reads)>num_reads_cff:
+                if True:
                     best_read_rec=''
                     for x in all_reads:
                         vapor_single_read_score=calcu_vapor_single_read_score_directed_dis_m1b_redefine_diagnal(ref_seq,alt_seq,x,window_size)
@@ -1841,13 +1854,12 @@ def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
                     make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name)
                     return vapor_score_list
     ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2]+flank_length)
-    [window_size,window_size_qc]=window_size_refine(ref_seq)
-    if not window_size=='Error':
+    all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,[sv_info[0],sv_info[2]],flank_length)
+    if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
         alt_seq=ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2])+ref_seq_readin(ref,sv_info[0],sv_info[1],sv_info[1]+flank_length)
         [window_size,window_size_qc]=window_size_refine(alt_seq)
         if not window_size=='Error':
-            all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,[sv_info[0],sv_info[2]],flank_length)
-            if len(all_reads)>num_reads_cff:
+            if True:
                 best_read_rec=''
                 for x in all_reads:
                     vapor_single_read_score=calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_size)
@@ -1973,14 +1985,15 @@ def vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_na
     vapor_score_list=[]
     best_read_rec=''
     if sv_info[2]-sv_info[1]<default_max_sv_test: #only try to read in all reads with sv <100K; else: try breakpoints ; 
+        #window_size_refine and read fetching are pure (clustering is seeded), and the window size is only
+        #used when enough reads exist, so reads are fetched first and the estimate is skipped otherwise
         ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[2]+flank_length)
-        [window_size,window_size_qc]=window_size_refine(ref_seq)
-        if not window_size=='Error':
+        all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
+        if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
             alt_seq=ref_seq[:flank_length]+reverse(complementary(ref_seq[flank_length:(-flank_length)]))+ref_seq[-flank_length:]
             [window_size,window_size_qc]=window_size_refine(alt_seq)
             if not window_size=='Error':
-                all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
-                if len(all_reads)>num_reads_cff:
+                if True:
                     best_read_rec=''
                     for x in all_reads:
                         vapor_single_read_score=calcu_vapor_single_read_score_abs_dis_m1b(ref_seq,alt_seq,x,window_size)
@@ -1990,13 +2003,12 @@ def vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_na
                     make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name)
                     return vapor_score_list
     ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[1]+flank_length)
-    [window_size,window_size_qc]=window_size_refine(ref_seq)
-    if not window_size=='Error':
+    all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
+    if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
         alt_seq=ref_seq[:flank_length]+ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2],'TRUE')
         [window_size,window_size_qc]=window_size_refine(alt_seq)
         if not window_size=='Error':
-            all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
-            if len(all_reads)>num_reads_cff:
+            if True:
                 best_read_rec=''
                 for x in all_reads:
                     vapor_single_read_score=calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_size)
