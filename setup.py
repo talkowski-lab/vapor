@@ -18,9 +18,10 @@ setup(
            "contrib/SMCScoring.py",
        ],
    },
-    ext_modules = cythonize("vapor_vali/*.pyx"),
+    # language_level 2: the scoring code relies on Cython 0.29's default (Python 2) semantics
+    ext_modules = cythonize("vapor_vali/*.pyx", compiler_directives={"language_level": 2}),
      install_requires=[
-     'cython', 'numpy','scipy','matplotlib','sklearn','rpy2'
+     'cython<3', 'numpy','scipy','matplotlib','scikit-learn','pysam'
       ],
     license="Propriety",
     keywords="Long read",

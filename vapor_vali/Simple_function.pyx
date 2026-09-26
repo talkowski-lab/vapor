@@ -16,6 +16,10 @@ from scipy import stats
 from scipy.stats import linregress
 from scipy.spatial import distance
 from sklearn import cluster
+try:
+    import pysam
+except ImportError:     #fall back to the samtools command line
+    pysam = None
 global invert_base
 invert_base = { 'A' : 'T', 'T' : 'A', 'C' : 'G', 'G' : 'C','N' : 'N','a' : 't', 't' : 'a', 'c' : 'g', 'g' : 'c','n' : 'n'}
 global default_flank_length
@@ -167,8 +171,10 @@ def calcu_vapor_single_read_score_abs_dis_m1(ref_seq,alt_seq,x,window_size):
     if float(len(ref_dotdata))/float(len(ref_seq))>0.1 and float(len(alt_dotdata))/float(len(alt_seq))>0.1 and float(ref_dotdata[-1][0]-ref_dotdata[0][0])/float(len(ref_seq))>0.7 and float(alt_dotdata[-1][0]-alt_dotdata[0][0])/float(len(alt_seq))>0.7:
         [ref_clean_dotdata,ref_kept_segs]=clean_dotdata_m1(ref_dotdata)
         [alt_clean_dotdata,alt_kept_segs]=clean_dotdata_m1(alt_dotdata)
-        ref_left=[i for i in ref_dotdata if not list(i) in ref_clean_dotdata]
-        alt_left=[i for i in alt_dotdata if not list(i) in alt_clean_dotdata]
+        ref_clean_set=set(tuple(i) for i in ref_clean_dotdata)
+        alt_clean_set=set(tuple(i) for i in alt_clean_dotdata)
+        ref_left=[i for i in ref_dotdata if not tuple(i) in ref_clean_set]
+        alt_left=[i for i in alt_dotdata if not tuple(i) in alt_clean_set]
         [ref_anti_diag_clean_dotdata,ref_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(ref_left)
         [alt_anti_diag_clean_dotdata,alt_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(alt_left)
         ref_clean_dotdata+=ref_anti_diag_clean_dotdata
@@ -281,8 +287,10 @@ def calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_siz
     if max([float(len(ref_dotdata))/float(len(ref_seq)),float(len(alt_dotdata))/float(len(alt_seq))])>0.1:
         [ref_clean_dotdata,ref_kept_segs]=clean_dotdata_diagnal_m1b(ref_dotdata)
         [alt_clean_dotdata,alt_kept_segs]=clean_dotdata_diagnal_m1b(alt_dotdata)
-        ref_left=[i for i in ref_dotdata if not list(i) in ref_clean_dotdata]
-        alt_left=[i for i in alt_dotdata if not list(i) in alt_clean_dotdata]
+        ref_clean_set=set(tuple(i) for i in ref_clean_dotdata)
+        alt_clean_set=set(tuple(i) for i in alt_clean_dotdata)
+        ref_left=[i for i in ref_dotdata if not tuple(i) in ref_clean_set]
+        alt_left=[i for i in alt_dotdata if not tuple(i) in alt_clean_set]
         [ref_anti_diag_clean_dotdata,ref_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(ref_left)
         [alt_anti_diag_clean_dotdata,alt_anti_diag_kept_segs]=clean_dotdata_anti_diagnal_m1b(alt_left)
         ref_clean_dotdata+=ref_anti_diag_clean_dotdata
@@ -337,12 +345,69 @@ def cigar2alignstart_by_pos(cigar,align_start,start,end):
     else:
         return [read_rec,start_dis]
 
+_pysam_handles={}
+
+def _pysam_handle(kind,path):
+    #one handle per (process, file): handles must never be shared across forked worker processes
+    key=(os.getpid(),kind,path)
+    h=_pysam_handles.get(key,False)
+    if h is False:
+        h=None
+        if pysam is not None:
+            try:
+                h=pysam.FastaFile(path) if kind=='fasta' else pysam.AlignmentFile(path,'rb')
+            except (IOError,OSError,ValueError):
+                h=None
+        _pysam_handles[key]=h
+    return h
+
+def _plain_region(handle,chrom,start,end):
+    #True when chrom:start-end is an ordinary 1-based inclusive region on which pysam and the
+    #samtools command line agree; odd regions (start<1, end<start, unknown contig, start past the
+    #contig end) are left to samtools itself because htslib's region parser has special cases for them
+    if handle is None or not (type(start) is int and type(end) is int): return False
+    try:
+        length=handle.get_reference_length(chrom)
+    except (KeyError,ValueError):
+        return False
+    return 1<=start<=end and start<=length
+
 def chop_pacbio_read_by_pos(bam_in_new,chrom,start,end,flank_length):
+    #same result as chop_pacbio_read_by_pos_samtools, using an indexed pysam query.
+    #samtools view chrom:start-end returns records overlapping [start-1,end) (0-based) and the loop keeps
+    #those with 1-based POS<=start; those are exactly the records overlapping [start-1,start), returned in
+    #the same file order, so fetching only that one base yields the same reads without parsing the rest
+    bam=_pysam_handle('bam',bam_in_new)
+    if not _plain_region(bam,chrom,start,end):
+        return chop_pacbio_read_by_pos_samtools(bam_in_new,chrom,start,end,flank_length)
+    out=[]
+    #a read is kept only if miss_bp<=flank_length/2 and len(read[align_start:])>end-start-miss_bp, which
+    #needs len(read)>end-start-flank_length/2; shorter reads can be skipped without parsing their CIGAR
+    min_len=end-start-flank_length/2
+    for read in bam.fetch(chrom,start-1,start):
+        qlen=read.query_length
+        if (qlen if qlen>0 else 1)<=min_len: continue      #SEQ '*' is a one-character read
+        cigar=read.cigarstring
+        if cigar is None: continue      #CIGAR '*'
+        pos=read.reference_start+1
+        if pos<start+1:
+            align_info=cigar2alignstart_by_pos(cigar,pos,start,end)
+            align_start=align_info[0]
+            miss_bp=align_info[1]
+            if not miss_bp>flank_length/2:
+                seq=read.query_sequence
+                if seq is None: seq='*'
+                target_read=seq[align_start:]
+                if len(target_read)>end-start-miss_bp:
+                    out.append([target_read[:end-start-miss_bp],miss_bp,read.query_name])
+    return out
+
+def chop_pacbio_read_by_pos_samtools(bam_in_new,chrom,start,end,flank_length):
     fbam=os.popen(r'''samtools view %s %s:%d-%d'''%(bam_in_new,chrom,start,end))
     out=[]
     for line in fbam:
         pbam=line.strip().split()
-        if not pbam[0]=='@': 
+        if not pbam[0]=='@' and not pbam[5]=='*':
             if int(pbam[3])<start+1:
                 align_info=cigar2alignstart_by_pos(pbam[5],int(pbam[3]),start,end)
                 align_start=align_info[0]
@@ -440,11 +505,12 @@ def clean_dotdata_diagnal_and_anti_diagnal(ref_dotdata):
     #[kept_dot_y,removed_dot_y]=dis_cluster_2(y_axis,dis_cff=10)
     [kept_dot_diag,removed_dot_diag]=dis_cluster_2(dis_to_diagnal,dis_cff=10)
     [kept_dot_anti_diag,removed_dot_anti_diag]=dis_cluster_2(dis_to_anti_diagnal,dis_cff=10)
+    removed_both=set(removed_dot_diag)&set(removed_dot_anti_diag)
     rec=-1
     kept_dot=[]
     for x in ref_dotdata:
         rec+=1
-        if rec in removed_dot_diag and rec in removed_dot_anti_diag:   continue
+        if rec in removed_both:   continue
         else:   kept_dot.append(x)
     return kept_dot
 
@@ -478,6 +544,12 @@ def complementary(seq):
                     seq2.append('atgcn'['tacgn'.index(i)])
     return ''.join(seq2)
 
+def _sequential_row_sum(a):
+    #bit-identical to the builtin sum(a) over the rows of a 2-D array: np.cumsum adds strictly left to
+    #right (unlike np.sum, which uses pairwise summation and can differ in the last bit)
+    if len(a)==0: return 0
+    return np.cumsum(a,axis=0)[-1]
+
 def compute_bic(kmeans,X):
     """
     Computes the BIC metric for a given clusters
@@ -502,9 +574,9 @@ def compute_bic(kmeans,X):
     cl_var=[]
     for i in range(m):
         if not n[i] - m==0:
-            cl_var.append((1.0 / (n[i] - m)) * sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
+            cl_var.append((1.0 / (n[i] - m)) * _sequential_row_sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
         else:
-            cl_var.append(float(10**20) * sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
+            cl_var.append(float(10**20) * _sequential_row_sum(distance.cdist(X[np.where(labels == i)], [centers[0][i]], 'euclidean')**2))
     const_term = 0.5 * m * calcu_log10(N)
     BIC = np.sum([n[i] * calcu_log10(n[i]) -
            n[i] * calcu_log10(N) -
@@ -531,10 +603,23 @@ def dup_inv_dup_bps_produce(sv_info,flank_length,alt_structure):
     else:
         return [alt_bps_new[1:3],alt_bps_new[3:5]]
 
+_dotdata_cache={}
+
+def dotdata_cache_clear():
+    #called at the start of every SV so that cached hit lists never outlive the SV they belong to
+    _dotdata_cache.clear()
+
 def dotdata(kmerlen,seq1, seq2):
-    nth_base = 1
-    inversions = True
-    hits = kmerhits(seq1, seq2, kmerlen, nth_base, inversions)
+    #dotdata is a pure function of its arguments and callers never modify the returned list, so the same
+    #hit list is reused whenever an SV asks for the same dot plot again (the second deletion scorer, the
+    #final window size of window_size_refine, and the four panels of make_event_figure_1)
+    key=(kmerlen,seq1,seq2)
+    hits=_dotdata_cache.get(key)
+    if hits is None:
+        nth_base = 1
+        inversions = True
+        hits = kmerhits(seq1, seq2, kmerlen, nth_base, inversions)
+        _dotdata_cache[key]=hits
     return hits
 
 def dis_cluster(dis_to_diagnal,dis_cff=10):
@@ -550,7 +635,8 @@ def dis_cluster(dis_to_diagnal,dis_cff=10):
     if remove_noise_1==[]:
         lenght_list=[len(i) for i in sub_group1]
         remove_noise_1=[i for i in sub_group1 if len(i)==max(lenght_list)]
-    return [[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in remove_noise_1]
+    group_sets=[set(j) for j in remove_noise_1]
+    return [[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in group_sets]
 
 def dis_cluster_2(dis_to_diagnal,dis_cff=10):
     #eg of dis_list=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 683, 854, 0, 683, 854, 0, 683, 854, 0, 683, 854, 0, 683, 0, 683, 0, 683, 0, 683, 0, 341, 512, 683, 0, 341, 512, 683, 0, 341, 512, 683, 0, 341, 512, 683, 1025, 0, 341, 512, 683, 1025, 0, 170, 341, 512, 683, 1025, 0, 170, 341, 683, 854, 1025, 0, 170, 683, 854, 1025, 0, 683, 1025, 0, 0, 0, 0, 0, 0, 0, 0, 512, 0, 512, 0, 512, 1196, 0, 170, 341, 512, 854, 1196, 1367, 0, 170, 341, 512, 854, 1196, 1367, 0]
@@ -562,9 +648,9 @@ def dis_cluster_2(dis_to_diagnal,dis_cff=10):
         else:
             sub_group1.append([i])
     remove_noise_1=[i for i in sub_group1 if len(i)>10]
-    out1=[[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in remove_noise_1]
-    out_total=[]
-    for i in out1:  out_total+=i
+    out1=[[i for i in range(len(dis_to_diagnal)) if dis_to_diagnal[i] in j] for j in [set(k) for k in remove_noise_1]]
+    out_total=set()
+    for i in out1:  out_total.update(i)
     out2=[i for i in range(len(dis_to_diagnal)) if not i in out_total]
     return [out1,out2]
 
@@ -844,10 +930,12 @@ def kept_lines_size_filter(size_list,square_size=400):
 
 def k_means_cluster(data_list):
     if max(data_list[0])-min(data_list[0])>10 and max(data_list[1])-min(data_list[1])>10:
-        array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
+        #same int64 C-ordered array as np.array([[x0,y0],[x1,y1],...]), built without the per-point lists
+        array_diagnal=np.ascontiguousarray(np.array([data_list[0],data_list[1]]).T)
         ks = list(range(1,min([5,len(data_list[0])+1])))
         KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
-        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit_predict(array_diagnal) for i in ks]
+        #a second identically seeded fit_predict returns exactly fit().labels_, so reuse it
+        KMeans_predict=[km.labels_ for km in KMeans]
         BIC=[]
         BIC_rec=[]
         for x in ks:
@@ -939,7 +1027,86 @@ def key_modify(key):
             key=key.replace('v','n')
     return key
 
+#k-mer alphabet after key_modify: IUPAC codes R,Y,S,W,K,M,B,D,H,V become N (n for lower case)
+_KMER_ALPHABET='ACGTNacgtn'
+_KMER_OTHER=15
+_kmer_code=np.full(256,_KMER_OTHER,dtype=np.uint64)
+for _i,_c in enumerate(_KMER_ALPHABET): _kmer_code[ord(_c)]=_i
+for _c in 'RYSWKMBDHV':
+    _kmer_code[ord(_c)]=_KMER_ALPHABET.index('N')
+    _kmer_code[ord(_c.lower())]=_KMER_ALPHABET.index('n')
+#complement of each alphabet code (invert_base): A<->T, C<->G, N->N, same for lower case
+_kmer_comp=np.array([_KMER_ALPHABET.index(invert_base[c]) for c in _KMER_ALPHABET],dtype=np.uint64)
+
+def _sliding_windows(arr,kmerlen):
+    #read-only (len-k+1, k) view of every length-k window of a 1-D array
+    #(numpy.lib.stride_tricks.sliding_window_view needs numpy >= 1.20)
+    return np.lib.stride_tricks.as_strided(arr,shape=(arr.shape[0]-kmerlen+1,kmerlen),
+                                           strides=(arr.strides[0],arr.strides[0]),writeable=False)
+
+def _kmer_ids_packed(codes,kmerlen):
+    #pack every k-mer window of a code array (4 bits per base) into ceil(k/16) uint64 words
+    win=_sliding_windows(codes,kmerlen)
+    words=[]
+    for a in range(0,kmerlen,16):
+        b=min(a+16,kmerlen)
+        shifts=np.arange(b-a,dtype=np.uint64)*np.uint64(4)
+        words.append((win[:,a:b]<<shifts).sum(axis=1,dtype=np.uint64))
+    return np.stack(words,axis=1)
+
 def kmerhits(seq1, seq2, kmerlen, nth_base=1, inversions=False):
+    #vectorised equivalent of kmerhits_python for the only configuration used (every base, inversions of
+    #seq1 only, exact matches). It returns the identical list: for every seq2 position i (ascending) and
+    #every seq1 position j (ascending) whose k-mer or reverse-complemented k-mer equals the seq2 k-mer, the
+    #tuple (i, j); a palindromic k-mer, which matches both ways, yields (i, j) twice, as in the original.
+    #Anything else, including sequences whose reverse complement would raise KeyError, uses the original.
+    if not (nth_base==1 and inversions and kmerlen<=40 and kmerlen>0):
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    n1=len(seq1)-kmerlen+1
+    n2=len(seq2)-kmerlen+1
+    if n1<=0 or n2<=0:
+        return []
+    try:
+        b1=seq1.encode('ascii')
+        b2=seq2.encode('ascii')
+    except UnicodeEncodeError:
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    c1=_kmer_code[np.frombuffer(b1,dtype=np.uint8)]
+    if (c1==_KMER_OTHER).any():     #invert_base lookup of the original raises KeyError here
+        return kmerhits_python(seq1, seq2, kmerlen, nth_base, inversions)
+    c2=_kmer_code[np.frombuffer(b2,dtype=np.uint8)]
+    fwd=_kmer_ids_packed(c1,kmerlen)
+    rc=_kmer_ids_packed(_kmer_comp[c1][::-1].copy(),kmerlen)[::-1]   #row j: reverse complement of k-mer j
+    qry=_kmer_ids_packed(np.minimum(c2,np.uint64(_KMER_ALPHABET.index('n'))),kmerlen)
+    #seq2 k-mers holding a character outside the alphabet can never match (seq1 k-mers never contain one)
+    bad=_sliding_windows(c2==_KMER_OTHER,kmerlen).any(axis=1)
+    allk=np.concatenate([fwd,rc,qry])
+    _,ids=np.unique(allk,axis=0,return_inverse=True)
+    ids=ids.reshape(-1)
+    fwd_id=ids[:n1]
+    rc_id=ids[n1:2*n1]
+    q_id=ids[2*n1:]
+    #lookup table entries (k-mer id, seq1 position); sorted by id then position like the original lists
+    ent_id=np.concatenate([fwd_id,rc_id])
+    ent_pos=np.concatenate([np.arange(n1),np.arange(n1)])
+    order=np.lexsort((ent_pos,ent_id))
+    ent_id=ent_id[order]
+    ent_pos=ent_pos[order]
+    lo=np.searchsorted(ent_id,q_id,side='left')
+    hi=np.searchsorted(ent_id,q_id,side='right')
+    cnt=hi-lo
+    cnt[bad]=0
+    total=int(cnt.sum())
+    if total==0:
+        return []
+    qi=np.repeat(np.arange(n2),cnt)
+    first=np.cumsum(cnt)-cnt
+    offs=np.arange(total)-np.repeat(first,cnt)
+    pj=ent_pos[np.repeat(lo,cnt)+offs]
+    return list(zip(qi.tolist(),pj.tolist()))
+
+def kmerhits_python(seq1, seq2, kmerlen, nth_base=1, inversions=False):
+    #original pure-Python implementation, kept as the reference and for configurations kmerhits does not cover
     # hash table for finding hits
     lookup = {}
     # store sequence hashes in hash table
@@ -1060,7 +1227,15 @@ def makeDotplot_subfigure(hits, title,figure_pos):
     #print "%.5f%% hits on diagonal" % (100 * len(hits2) / float(len(hits)))
     # create plot
 
+_plots_enabled=True
+
+def set_plot_output(enabled):
+    #plots are an optional by-product: skipping them changes no score (make_event_figure_1 only draws)
+    global _plots_enabled
+    _plots_enabled=bool(enabled)
+
 def make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name):
+    if not _plots_enabled: return
     nth_base = 1
     inversions = True
     if not best_read_rec=='':
@@ -1075,7 +1250,8 @@ def make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_se
                 makeDotplot_subfigure(hits_alt_alt,'alt vs. alt',222)
                 makeDotplot_subfigure(hits_ref,'read vs. ref',223)
                 makeDotplot_subfigure(hits_alt,'read vs. alt',224)
-                plt.savefig(out_figure_name)
+                #fig.savefig writes the same file as plt.savefig, without the extra redraw pyplot performs after saving
+                fig.savefig(out_figure_name)
                 #plt.show()
                 plt.close(fig)
 
@@ -1085,7 +1261,7 @@ def minimize_pacbio_read_list(x,ideal_list_length=20):
         out=[]
         temp_hash={}
         for x in x:
-            if not x[1] in list(temp_hash.keys()):    temp_hash[x[1]]=[x]
+            if not x[1] in temp_hash:    temp_hash[x[1]]=[x]
             else:    temp_hash[x[1]]+=[x]
         for x in sorted(temp_hash.keys()):
             if len(out)<ideal_list_length:    out+=temp_hash[x]
@@ -1111,7 +1287,7 @@ def number_cluster(dis_to_diagnal_list,dis_range):
 def one_dimention_cluster_by_gap(dim1,gap,length):
     out_hash={}
     for k1 in range(len(dim1)):
-        if not dim1[k1] in list(out_hash.keys()): out_hash[dim1[k1]]=[]
+        if not dim1[k1] in out_hash: out_hash[dim1[k1]]=[]
         out_hash[dim1[k1]].append(k1)
     sorted_keys=sorted(out_hash.keys())
     out=[[sorted_keys[0]]]
@@ -1128,7 +1304,7 @@ def one_dimention_cluster_by_gap(dim1,gap,length):
 
 def path_mkdir(path):
     if not os.path.isdir(path):
-        os.system(r'''mkdir %s'''%(path))
+        os.makedirs(path)
 
 def path_modify(path):
     if not path[-1]=='/':
@@ -1194,6 +1370,19 @@ def ref_deviate_lines_calcu(list_dotdata):
 def ref_seq_readin(ref,chrom,start,end,reverse_flag='FALSE'):
     #reverse=='TRUE': return rev-comp-seq   ; if not specified, default as 'FALSE'
     #else: return original seq
+    #same result as ref_seq_readin_samtools (samtools faidx ref chrom:start-end) via an open pysam handle
+    start=int(start)
+    end=int(end)
+    fa=_pysam_handle('fasta',ref)
+    if not _plain_region(fa,chrom,start,end):
+        return ref_seq_readin_samtools(ref,chrom,start,end,reverse_flag)
+    seq=fa.fetch(chrom,start-1,end)
+    if reverse_flag=='FALSE':
+        return seq
+    else:
+        return reverse(complementary(seq))
+
+def ref_seq_readin_samtools(ref,chrom,start,end,reverse_flag='FALSE'):
     fref=os.popen(r'''samtools faidx %s %s:%d-%d'''%(ref,chrom,int(start),int(end)))
     fref.readline().strip().split()
     seq=''
@@ -1479,6 +1668,7 @@ def unify_list(list):
     return out
 
 def vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['ab_ab', 'b_b^', 'chr7', '70955990', '70961199', '70973901']
     ref_sv=sv_info[0].split('_')
     alt_sv=list_unify([i for i in sv_info[1].split('_') if not i in ref_sv])
@@ -1546,6 +1736,7 @@ def vapor_CANNOT_CLASSIFY_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figu
     return vapor_score_list
 
 def vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     sv_block=[sv_info[0][0],sv_info[0][1],sv_info[-1][2]]
     flank_length=flank_length_calculate(sv_block)
     vapor_score_list=[]
@@ -1584,6 +1775,7 @@ def vapor_del_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
     return vapor_score_list
 
 def vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['chr1', 114103333, 114103408, 'chr1', 114111746]
     sv_info[1:3]=[int(i) for i in sv_info[1:3]]
     dup_block=sv_info[:3]
@@ -1660,6 +1852,7 @@ def vapor_dup_inv_VapoR(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name)
     return vapor_score_list
 
 def vapor_long_del_inv(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=[['chr19', 46275941, 46314150, 'del'], ['chr19', 46314150, 46314312, 'inv']]
     vapor_score_list=[]
     best_read_rec=''
@@ -1690,6 +1883,7 @@ def write_test_data(file_out,ref_dotdata,alt_dotdata):
     fo.close()
 
 def vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #eg of sv_info=['chr1', 101553562, 101553905]
     flank_length=flank_length_calculate(sv_info)
     vapor_score_list=[]
@@ -1736,19 +1930,20 @@ def vapor_simple_del_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_na
     return vapor_score_list
 
 def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
    #vapor_simple_del_Vapor(bam_in,ref,x[:-2],out_path+sample_name+'.TANDUP.'+key_event+'.png')
     flank_length=flank_length_calculate(sv_info)
     vapor_score_list=[]
     best_read_rec=''
     if sv_info[2]-sv_info[1]<default_max_sv_test: #only try to read in all reads with sv <100K; else: try breakpoints ; 
+        #reads first, window size only when needed (see vapor_simple_inv_Vapor)
         ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[2]+flank_length)
-        [window_size,window_size_qc]=window_size_refine(ref_seq)
-        if not window_size=='Error':
+        all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info[:2]+[sv_info[1]+2*(sv_info[2]-sv_info[1])],flank_length)
+        if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
             alt_seq=ref_seq[:flank_length]+ref_seq[flank_length:(-flank_length)]+ref_seq[flank_length:(-flank_length)]+ref_seq[-flank_length:]
             [window_size,window_size_qc]=window_size_refine(alt_seq)
             if not window_size=='Error':
-                all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info[:2]+[sv_info[1]+2*(sv_info[2]-sv_info[1])],flank_length)
-                if len(all_reads)>num_reads_cff:
+                if True:
                     best_read_rec=''
                     for x in all_reads:
                         vapor_single_read_score=calcu_vapor_single_read_score_directed_dis_m1b_redefine_diagnal(ref_seq,alt_seq,x,window_size)
@@ -1758,13 +1953,12 @@ def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
                     make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name)
                     return vapor_score_list
     ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2]+flank_length)
-    [window_size,window_size_qc]=window_size_refine(ref_seq)
-    if not window_size=='Error':
+    all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,[sv_info[0],sv_info[2]],flank_length)
+    if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
         alt_seq=ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2])+ref_seq_readin(ref,sv_info[0],sv_info[1],sv_info[1]+flank_length)
         [window_size,window_size_qc]=window_size_refine(alt_seq)
         if not window_size=='Error':
-            all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,[sv_info[0],sv_info[2]],flank_length)
-            if len(all_reads)>num_reads_cff:
+            if True:
                 best_read_rec=''
                 for x in all_reads:
                     vapor_single_read_score=calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_size)
@@ -1775,6 +1969,7 @@ def vapor_simple_tandup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
     return vapor_score_list
 
 def vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     sv_info[1:3]=[int(i) for i in sv_info[1:3]]
     dup_block=sv_info[:3]
     ins_point=[sv_info[3],int(sv_info[4])]
@@ -1845,6 +2040,7 @@ def vapor_simple_disdup_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure
     return vapor_score_list
 
 def vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_figure_name,POLARITY):
+    dotdata_cache_clear()
     #eg of ins_pos='chr1_83144055'
     #eg of bam_in='/nfs/turbo/remillsscr/scratch2_trans/datasets/1000genomes/vol1/ftp/data_collections/hgsv_sv_discovery/PacBio/alignment/HG00512.XXX.bam'
     #eg of ref='/scratch/remills_flux/xuefzhao/reference/GRCh38.1KGP/GRCh38_full_analysis_set_plus_decoy_hla.fa'
@@ -1884,20 +2080,22 @@ def vapor_simple_ins_Vapor(num_reads_cff,plt_li,bam_in,ref,ins_pos,ins_seq,out_f
     return vapor_score_list
 
 def vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_name):
+    dotdata_cache_clear()
     #vapor_simple_inv_Vapor(bam_in,ref,y,out_path+sample_name+'.INV.'+key_event+'.png')
     #eg of sv_info=['chr1', 101553562, 101553905]
     flank_length=flank_length_calculate(sv_info)
     vapor_score_list=[]
     best_read_rec=''
     if sv_info[2]-sv_info[1]<default_max_sv_test: #only try to read in all reads with sv <100K; else: try breakpoints ; 
+        #window_size_refine and read fetching are pure (clustering is seeded), and the window size is only
+        #used when enough reads exist, so reads are fetched first and the estimate is skipped otherwise
         ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[2]+flank_length)
-        [window_size,window_size_qc]=window_size_refine(ref_seq)
-        if not window_size=='Error':
+        all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
+        if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
             alt_seq=ref_seq[:flank_length]+reverse(complementary(ref_seq[flank_length:(-flank_length)]))+ref_seq[-flank_length:]
             [window_size,window_size_qc]=window_size_refine(alt_seq)
             if not window_size=='Error':
-                all_reads=simple_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
-                if len(all_reads)>num_reads_cff:
+                if True:
                     best_read_rec=''
                     for x in all_reads:
                         vapor_single_read_score=calcu_vapor_single_read_score_abs_dis_m1b(ref_seq,alt_seq,x,window_size)
@@ -1907,13 +2105,12 @@ def vapor_simple_inv_Vapor(num_reads_cff,plt_li,bam_in,ref,sv_info,out_figure_na
                     make_event_figure_1(plt_li,vapor_score_list,best_read_rec,window_size,ref_seq,alt_seq,out_figure_name)
                     return vapor_score_list
     ref_seq=ref_seq_readin(ref,sv_info[0],sv_info[1]-flank_length,sv_info[1]+flank_length)
-    [window_size,window_size_qc]=window_size_refine(ref_seq)
-    if not window_size=='Error':
+    all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
+    if len(all_reads)>num_reads_cff and not window_size_refine(ref_seq)[0]=='Error':
         alt_seq=ref_seq[:flank_length]+ref_seq_readin(ref,sv_info[0],sv_info[2]-flank_length,sv_info[2],'TRUE')
         [window_size,window_size_qc]=window_size_refine(alt_seq)
         if not window_size=='Error':
-            all_reads=simple_del_chop_pacbio_read_simple_short(bam_in,sv_info,flank_length)
-            if len(all_reads)>num_reads_cff:
+            if True:
                 best_read_rec=''
                 for x in all_reads:
                     vapor_single_read_score=calcu_vapor_single_read_score_within_10Perc_m1b(ref_seq,alt_seq,x,window_size)
@@ -2074,9 +2271,13 @@ def write_output_initiate(out_name):
 
 def write_output_main(out_name,out_list):
     fo=open(out_name,'a')
+    write_output_row(fo,out_list)
+    fo.close()
+
+def write_output_row(fo,out_list):
+    #write_output_main on an already open file
     if not 'NA' in out_list:    print('\t'.join([str(i) for i in out_list[:-1]+gt_estimate_log_likelihood(out_list)+[out_list[-1]]]), file=fo)
     else:                       print('\t'.join([str(i) for i in out_list[:-1]+['NA','NA','NA']]), file=fo)
-    fo.close()
 
 def x_to_x_modify_new(x,dup_block_combined):
     x_modify=[[i] for i in list(x)]
