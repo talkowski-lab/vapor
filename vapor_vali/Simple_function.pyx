@@ -878,7 +878,8 @@ def k_means_cluster(data_list):
             out=[]
             std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
             whitened = whiten(array_diagnal)
-            centroids, distortion=kmeans(whitened,ks_picked,seed=KMEANS_SEED)
+            np.random.seed(KMEANS_SEED)    #scipy kmeans draws its initial centroids from numpy's global random state; scipy 1.5, the last release for Python 3.6, has no seed argument
+            centroids, distortion=kmeans(whitened,ks_picked)
             idx,_= vq(whitened,centroids)
             for x in range(ks_picked):
                 group1=[[int(i) for i in array_diagnal[idx==x,0]],[int(i) for i in array_diagnal[idx==x,1]]]
@@ -899,7 +900,8 @@ def k_means_cluster_Predict(data_list,info):
         out=[]
         std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
         whitened = whiten(array_diagnal)
-        centroids, distortion=kmeans(whitened,ks_picked,seed=KMEANS_SEED)
+        np.random.seed(KMEANS_SEED)    #scipy kmeans draws its initial centroids from numpy's global random state; scipy 1.5, the last release for Python 3.6, has no seed argument
+        centroids, distortion=kmeans(whitened,ks_picked)
         idx,_= vq(whitened,centroids)
         for x in range(ks_picked):
             group1=[[int(i) for i in array_diagnal[idx==x,0]],[int(i) for i in array_diagnal[idx==x,1]]]
