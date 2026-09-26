@@ -23,6 +23,7 @@ default_flank_length=500
 global default_read_length
 default_read_length=4000    #average length of pacbio read
 global default_max_sv_test
+KMEANS_SEED=0 #fixed seed for sklearn KMeans and scipy kmeans, so results are reproducible
 default_max_sv_test=10000 #when size of a sv block excessed default_max_sv_test, try junctions instead of event
 
 def alt_seq_readin(ref,info,flank_length):
@@ -845,8 +846,8 @@ def k_means_cluster(data_list):
     if max(data_list[0])-min(data_list[0])>10 and max(data_list[1])-min(data_list[1])>10:
         array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
         ks = list(range(1,min([5,len(data_list[0])+1])))
-        KMeans = [cluster.KMeans(n_clusters = i, init="k-means++").fit(array_diagnal) for i in ks]
-        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++").fit_predict(array_diagnal) for i in ks]
+        KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
+        KMeans_predict=[cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit_predict(array_diagnal) for i in ks]
         BIC=[]
         BIC_rec=[]
         for x in ks:
@@ -865,6 +866,7 @@ def k_means_cluster(data_list):
             out=[]
             std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
             whitened = whiten(array_diagnal)
+            np.random.seed(KMEANS_SEED)    #scipy kmeans draws its initial centroids from numpy's global random state; scipy 1.5, the last release for Python 3.6, has no seed argument
             centroids, distortion=kmeans(whitened,ks_picked)
             idx,_= vq(whitened,centroids)
             for x in range(ks_picked):
@@ -877,7 +879,7 @@ def k_means_cluster(data_list):
 def k_means_cluster_Predict(data_list,info):
     array_diagnal=np.array([[data_list[0][x],data_list[1][x]] for x in range(len(data_list[0]))])
     ks = list(range(1,len(info)))
-    KMeans = [cluster.KMeans(n_clusters = i, init="k-means++").fit(array_diagnal) for i in ks]
+    KMeans = [cluster.KMeans(n_clusters = i, init="k-means++", random_state=KMEANS_SEED).fit(array_diagnal) for i in ks]
     BIC = [compute_bic(kmeansi,array_diagnal) for kmeansi in KMeans]
     ks_picked=ks[BIC.index(max(BIC))]
     if ks_picked==1:
@@ -886,6 +888,7 @@ def k_means_cluster_Predict(data_list,info):
         out=[]
         std_rec=[scipy.std(data_list[0]),scipy.std(data_list[1])]
         whitened = whiten(array_diagnal)
+        np.random.seed(KMEANS_SEED)    #scipy kmeans draws its initial centroids from numpy's global random state; scipy 1.5, the last release for Python 3.6, has no seed argument
         centroids, distortion=kmeans(whitened,ks_picked)
         idx,_= vq(whitened,centroids)
         for x in range(ks_picked):
