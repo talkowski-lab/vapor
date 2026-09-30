@@ -1,6 +1,0 @@
-cython
-numpy
-scipy
-matplotlib
-sklearn
-rpy2

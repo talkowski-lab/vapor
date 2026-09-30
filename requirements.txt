@@ -1,0 +1,16 @@
+# Library versions of the original vapor image (Ubuntu 18.04, Python 3.6), which the optimized code
+# was regression-tested against. Scores depend on them (scikit-learn KMeans in particular), so keep
+# them pinned when outputs must match the original. Needs Python 3.6.
+Cython==0.29.37
+numpy==1.19.5
+scipy==1.5.4
+scikit-learn==0.24.2
+joblib==1.1.1
+threadpoolctl==3.1.0
+matplotlib==3.3.4
+pillow==8.4.0
+cycler==0.11.0
+kiwisolver==1.3.1
+pyparsing==3.1.4
+python-dateutil==2.9.0.post0
+pysam==0.23.0
